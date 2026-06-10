@@ -1,0 +1,5 @@
+streamlit
+supabase
+folium
+streamlit-folium
+geopy
