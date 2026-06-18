@@ -3,6 +3,7 @@ from __future__ import annotations
 import streamlit as st
 
 from db.client import has_supabase, show_supabase_warning
+from services.spatial_service import SpatialAnalysisError, get_postgis_status
 from utils.secret_utils import read_secret
 
 
@@ -30,8 +31,10 @@ def render_home(client) -> None:
             - **경로별 침수·도로 통제·최근 신고 위험 분석**
             - **50점 이상 또는 최근 신고 포함 시 우회 경로 탐색**
             - **경로에 포함된 신고 내용과 위험 근거 표시**
-            - **경로 검색 로그·추천 경로·위험 상세 DB 저장**
-            - **경로 좌표를 표준 GeoJSON LineString으로 저장**
+            - **경로 검색 요청·추천 결과·위험 근거를 Supabase에 저장**
+            - **경로 좌표를 GeoJSON LineString과 PostGIS LineString으로 저장**
+            - **PostGIS ST_Intersects 기반 침수 Polygon 실제 교차 분석**
+            - **ST_DWithin 기반 신고·도로 알림 반경 분석**
             """
         )
 
@@ -39,15 +42,15 @@ def render_home(client) -> None:
         st.markdown("### 다음 구현 단계")
         st.markdown(
             """
-            - PostGIS 공간 자료형 도입
-            - 저장된 GeoJSON 경로를 PostGIS LineString으로 변환
-            - 경로 LineString과 침수 Polygon의 정확한 교차 판별
             - 기상청 API 실시간 연동
+            - 서울시 침수 Polygon 자동 적재
+            - TOPIS 도로 통제 데이터 자동 연동
+            - 공간 분석 결과를 활용한 추천 로직 고도화
             """
         )
 
     st.markdown("### 연동 상태")
-    status_col1, status_col2 = st.columns(2)
+    status_col1, status_col2, status_col3 = st.columns(3)
 
     with status_col1:
         if has_supabase(client):
@@ -64,7 +67,21 @@ def render_home(client) -> None:
         else:
             st.warning("TMAP_APP_KEY가 아직 설정되지 않았습니다.")
 
+    with status_col3:
+        if not has_supabase(client):
+            st.warning("Supabase 연결 후 PostGIS 상태를 확인할 수 있습니다.")
+        else:
+            try:
+                status = get_postgis_status(client)
+                version = status.get("postgis_version", "확인됨")
+                polygon_count = status.get("flood_polygon_count", 0)
+                st.success(f"PostGIS {version} · 침수 Polygon {polygon_count}개")
+            except SpatialAnalysisError as error:
+                st.warning("PostGIS SQL 적용이 필요합니다.")
+                st.caption(str(error))
+
     st.info(
-        "로그인 상태의 경로 검색 결과는 세 경로 테이블에 자동 저장됩니다. "
-        "현재는 중심 좌표와 반경으로 위험을 근사 분석하며, 다음 단계에서 PostGIS로 실제 공간 교차 여부를 정밀 분석합니다."
+        "로그인 상태에서 실행한 경로 검색은 세 경로 테이블에 자동 저장됩니다. "
+        "침수 GeoJSON이 유효한 Polygon이면 ST_Intersects로 실제 교차를 판별하고, "
+        "Polygon이 없는 기존 행은 중심점 100m 보조 방식으로 처리합니다."
     )

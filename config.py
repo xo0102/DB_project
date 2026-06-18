@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import timedelta, timezone
 
 APP_TITLE = "도시 생존 네비게이터"
-APP_SUBTITLE = "웹 DB 응용 · 위험 기반 경로 추천"
+APP_SUBTITLE = "웹 DB 응용 · TMAP + PostGIS 위험 경로 추천"
 
 KST = timezone(timedelta(hours=9))
 DEFAULT_LAT = 37.2792

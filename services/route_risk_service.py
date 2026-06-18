@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from math import cos, hypot, radians
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -11,11 +11,17 @@ from db.queries import (
     get_flood_zones,
     get_latest_weather,
 )
+from services.spatial_service import (
+    SpatialAnalysisError,
+    SpatialRiskHit,
+    query_route_spatial_risks,
+)
 from services.tmap_service import PedestrianRoute, TmapApiError, search_pedestrian_route
 from utils.formatters import format_error_message, to_float, to_int
 
 MapPoint = Tuple[float, float]
 RouteSearcher = Callable[..., PedestrianRoute]
+RouteAnalyzer = Callable[[Sequence[MapPoint], "RouteRiskContext"], "RouteRiskAnalysis"]
 
 RISK_TRIGGER_SCORE = 50
 FLOOD_ROUTE_RADIUS_M = 100
@@ -51,6 +57,9 @@ class RouteRiskItem:
     report_created_at: str = ""
     duplicate_count: int = 0
     route_position: float = 0.0
+    spatial_method: str = "python_distance"
+    overlap_length_m: float = 0.0
+    hazard_geojson: Optional[Dict[str, Any]] = None
 
     @property
     def is_spatial(self) -> bool:
@@ -63,6 +72,8 @@ class RouteRiskAnalysis:
     items: List[RouteRiskItem]
     category_scores: Dict[str, int]
     has_recent_report: bool
+    analysis_engine: str = "python_approximation"
+    analysis_warning: str = ""
 
     @property
     def should_offer_alternative(self) -> bool:
@@ -380,19 +391,117 @@ def analyze_route_risk(
             )
         )
 
-    category_scores: Dict[str, int] = {}
-    for item in items:
-        category_scores[item.source_type] = category_scores.get(item.source_type, 0) + item.risk_score
+    return _finalize_analysis(items, analysis_engine="python_approximation")
 
-    total_score = min(sum(max(0, item.risk_score) for item in items), 100)
-    has_recent_report = any(item.recent_report for item in items)
+
+def _finalize_analysis(
+    items: Sequence[RouteRiskItem],
+    *,
+    analysis_engine: str,
+    analysis_warning: str = "",
+) -> RouteRiskAnalysis:
+    normalized_items = list(items)
+    category_scores: Dict[str, int] = {}
+    for item in normalized_items:
+        category_scores[item.source_type] = (
+            category_scores.get(item.source_type, 0) + max(0, item.risk_score)
+        )
+
+    total_score = min(sum(max(0, item.risk_score) for item in normalized_items), 100)
+    has_recent_report = any(item.recent_report for item in normalized_items)
 
     return RouteRiskAnalysis(
         total_score=total_score,
-        items=items,
+        items=normalized_items,
         category_scores=category_scores,
         has_recent_report=has_recent_report,
+        analysis_engine=analysis_engine,
+        analysis_warning=analysis_warning,
     )
+
+
+def _spatial_hit_to_item(hit: SpatialRiskHit) -> RouteRiskItem:
+    return RouteRiskItem(
+        source_type=hit.source_type,
+        source_id=hit.source_id,
+        risk_type=hit.risk_type,
+        title=hit.title,
+        risk_score=hit.risk_score,
+        reason=hit.reason,
+        latitude=hit.latitude,
+        longitude=hit.longitude,
+        distance_to_route_m=hit.distance_to_route_m,
+        influence_radius_m=hit.influence_radius_m,
+        recent_report=hit.recent_report,
+        report_description=hit.report_description,
+        report_created_at=hit.report_created_at,
+        duplicate_count=hit.duplicate_count,
+        route_position=hit.route_position,
+        spatial_method=hit.spatial_method,
+        overlap_length_m=hit.overlap_length_m,
+        hazard_geojson=hit.hazard_geojson,
+    )
+
+
+def analyze_route_risk_postgis(
+    client,
+    route_coordinates: Sequence[MapPoint],
+    context: RouteRiskContext,
+) -> RouteRiskAnalysis:
+    """PostGIS의 ST_Intersects·ST_DWithin 결과와 최신 날씨 점수를 결합한다."""
+    hits = query_route_spatial_risks(client, route_coordinates)
+    items = [_spatial_hit_to_item(hit) for hit in hits]
+
+    weather = context.weather or {}
+    weather_score = max(0, to_int(weather.get("risk_score"), 0))
+    if weather_score:
+        rain_current = to_float(weather.get("rain_current_mm"), 0.0)
+        rain_forecast = to_float(weather.get("rain_forecast_mm"), 0.0)
+        items.append(
+            RouteRiskItem(
+                source_type="weather",
+                source_id=to_int(weather.get("id"), 0) or None,
+                risk_type="weather",
+                title="최신 강수 위험",
+                risk_score=weather_score,
+                reason=(
+                    f"현재 강수량 {rain_current:g}mm, 예보 강수량 {rain_forecast:g}mm가 "
+                    f"모든 경로에 공통으로 반영됩니다."
+                ),
+                spatial_method="global_weather",
+            )
+        )
+
+    return _finalize_analysis(items, analysis_engine="postgis")
+
+
+def make_route_analyzer(client) -> RouteAnalyzer:
+    """PostGIS를 우선 사용하고, 실패하면 같은 검색 동안 Python 근사 분석으로 대체한다."""
+    postgis_error = ""
+
+    def analyzer(
+        route_coordinates: Sequence[MapPoint],
+        context: RouteRiskContext,
+    ) -> RouteRiskAnalysis:
+        nonlocal postgis_error
+
+        if not postgis_error:
+            try:
+                return analyze_route_risk_postgis(client, route_coordinates, context)
+            except SpatialAnalysisError as error:
+                postgis_error = str(error)
+
+        fallback = analyze_route_risk(route_coordinates, context)
+        return replace(
+            fallback,
+            analysis_engine="python_fallback",
+            analysis_warning=(
+                "PostGIS 분석을 사용할 수 없어 기존 중심 좌표·반경 방식으로 계산했습니다. "
+                f"상세: {postgis_error}"
+            ),
+        )
+
+    return analyzer
 
 
 def _analysis_rank(analysis: RouteRiskAnalysis) -> Tuple[int, int, int, int]:
@@ -511,6 +620,7 @@ def create_route_recommendation(
     start_name: str,
     end_name: str,
     route_searcher: RouteSearcher = search_pedestrian_route,
+    route_analyzer: RouteAnalyzer = analyze_route_risk,
 ) -> RouteRecommendation:
     """
     기본 경로를 분석하고, 50점 이상이거나 최근 신고가 포함되면 경유점 기반 대안 경로를 탐색한다.
@@ -518,7 +628,7 @@ def create_route_recommendation(
     TMAP 자체에 임의의 위험 Polygon을 직접 제외시키는 요청은 하지 못하므로,
     위험 구간 좌·우에 경유점을 만들어 여러 후보를 요청한 뒤 가장 안전한 후보를 고른다.
     """
-    primary_analysis = analyze_route_risk(primary_route.route_coordinates, context)
+    primary_analysis = route_analyzer(primary_route.route_coordinates, context)
 
     if not primary_analysis.should_offer_alternative:
         return RouteRecommendation(
@@ -565,7 +675,7 @@ def create_route_recommendation(
                 end_name=end_name,
                 pass_points=pass_points,
             )
-            analysis = analyze_route_risk(route.route_coordinates, context)
+            analysis = route_analyzer(route.route_coordinates, context)
             candidates.append((route, analysis, pass_points))
         except TmapApiError as error:
             errors.append(str(error))

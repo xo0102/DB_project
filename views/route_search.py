@@ -25,6 +25,7 @@ from services.route_risk_service import (
     RouteRiskItem,
     create_route_recommendation,
     load_route_risk_context,
+    make_route_analyzer,
 )
 from services.tmap_service import PedestrianRoute, TmapApiError, search_pedestrian_route
 from utils.geo_utils import distance_meters
@@ -44,7 +45,7 @@ SELECT_TARGET_WIDGET_KEY = "route_select_target_widget"
 LAST_CLICK_KEY = "route_last_processed_click"
 MAP_VERSION_KEY = "route_map_version"
 FLASH_MESSAGE_KEY = "route_flash_message"
-SAVE_SUMMARY_KEY = "route_db_save_summary"
+SAVE_RESULT_KEY = "route_db_save_result"
 SAVE_ERROR_KEY = "route_db_save_error"
 
 DEFAULT_END_LAT = DEFAULT_LAT + 0.003
@@ -55,6 +56,15 @@ SOURCE_LABELS = {
     "flood_zone": "침수 이력·예상 구역",
     "road_alert": "도로 통제·알림",
     "weather": "날씨",
+}
+
+SPATIAL_METHOD_LABELS = {
+    "polygon_intersection": "Polygon 실제 교차",
+    "center_radius_fallback": "중심점 반경 보조 판별",
+    "report_radius": "신고 반경 ST_DWithin",
+    "road_alert_radius": "도로 알림 ST_DWithin",
+    "global_weather": "모든 경로 공통",
+    "python_distance": "Python 거리 근사",
 }
 
 
@@ -108,7 +118,7 @@ def _init_route_state() -> None:
 def _clear_route_result() -> None:
     st.session_state.pop(SESSION_RECOMMENDATION_KEY, None)
     st.session_state.pop(DIRECT_DISTANCE_KEY, None)
-    st.session_state.pop(SAVE_SUMMARY_KEY, None)
+    st.session_state.pop(SAVE_RESULT_KEY, None)
     st.session_state.pop(SAVE_ERROR_KEY, None)
 
 
@@ -238,6 +248,7 @@ def _search_route(app_key: str, client) -> None:
                 "침수·도로 통제·최근 신고 위험을 분석하고, 필요하면 회피 경로를 탐색하고 있습니다..."
             ):
                 context = load_route_risk_context(client)
+                route_analyzer = make_route_analyzer(client)
                 recommendation = create_route_recommendation(
                     primary_route=primary_route,
                     context=context,
@@ -246,6 +257,7 @@ def _search_route(app_key: str, client) -> None:
                     end=end,
                     start_name=start_name,
                     end_name=end_name,
+                    route_analyzer=route_analyzer,
                 )
         else:
             recommendation = RouteRecommendation(
@@ -261,15 +273,15 @@ def _search_route(app_key: str, client) -> None:
             end[0],
             end[1],
         )
-        st.session_state.pop(SAVE_SUMMARY_KEY, None)
+        st.session_state.pop(SAVE_RESULT_KEY, None)
         st.session_state.pop(SAVE_ERROR_KEY, None)
 
         if has_supabase(client) and is_logged_in():
             try:
                 with st.spinner(
-                    "경로 검색 기록, 추천 경로, 위험 근거를 Supabase에 저장하고 있습니다..."
+                    "검색 기록, 추천 경로, 위험 근거를 Supabase에 저장하고 있습니다..."
                 ):
-                    save_summary = save_route_recommendation(
+                    saved = save_route_recommendation(
                         client=client,
                         recommendation=recommendation,
                         start=start,
@@ -277,27 +289,28 @@ def _search_route(app_key: str, client) -> None:
                         start_name=start_name,
                         end_name=end_name,
                     )
-                st.session_state[SAVE_SUMMARY_KEY] = save_summary
+                st.session_state[SAVE_RESULT_KEY] = saved
             except RoutePersistenceError as error:
-                # 경로 화면은 유지하고 DB 저장 실패만 별도로 안내한다.
+                # 저장 실패가 TMAP 결과까지 지우지 않도록 별도 상태로만 보관한다.
                 st.session_state[SAVE_ERROR_KEY] = str(error)
         elif has_supabase(client):
             st.session_state[SAVE_ERROR_KEY] = (
                 "로그인하지 않아 이번 검색 결과는 DB에 저장하지 않았습니다. "
-                "로그인 후 다시 검색하면 route_search_logs, route_results, "
-                "route_risk_details에 자동 저장됩니다."
+                "로그인 후 다시 검색하면 세 경로 테이블에 자동 저장됩니다."
             )
         else:
             st.session_state[SAVE_ERROR_KEY] = (
                 "Supabase에 연결되지 않아 이번 검색 결과는 DB에 저장하지 않았습니다."
             )
 
-        if recommendation.alternative_route:
-            st.session_state[FLASH_MESSAGE_KEY] = (
-                "기본 경로 분석을 마쳤고, 위험 회피 대안 경로도 함께 생성했습니다."
-            )
-        else:
-            st.session_state[FLASH_MESSAGE_KEY] = "기본 경로 검색과 위험 분석을 완료했습니다."
+        route_message = (
+            "기본 경로 분석을 마쳤고, 위험 회피 대안 경로도 함께 생성했습니다."
+            if recommendation.alternative_route
+            else "기본 경로 검색과 위험 분석을 완료했습니다."
+        )
+        if st.session_state.get(SAVE_RESULT_KEY):
+            route_message += " 검색 결과도 Supabase에 저장했습니다."
+        st.session_state[FLASH_MESSAGE_KEY] = route_message
 
         _refresh_map_component()
         st.rerun()
@@ -310,27 +323,6 @@ def _search_route(app_key: str, client) -> None:
         st.error(f"예상하지 못한 오류가 발생했습니다: {error}")
 
 
-def _show_db_save_status() -> None:
-    summary: Optional[SavedRouteRecommendation] = st.session_state.get(SAVE_SUMMARY_KEY)
-    error_message = st.session_state.get(SAVE_ERROR_KEY)
-
-    if summary:
-        st.success(
-            f"DB 저장 완료: 검색 로그 1건, 경로 결과 {summary.route_count}건, "
-            f"위험 상세 {summary.risk_detail_count}건"
-        )
-        with st.expander("저장된 DB ID 확인"):
-            st.json(summary.to_dict())
-        return
-
-    if error_message:
-        st.warning(error_message)
-        if "row-level security" in str(error_message).lower() or "42501" in str(error_message):
-            st.info(
-                "Supabase SQL Editor에서 `sql/route_persistence.sql`을 한 번 실행했는지 확인해주세요."
-            )
-
-
 def _risk_rows(analysis: RouteRiskAnalysis) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for item in analysis.items:
@@ -340,12 +332,15 @@ def _risk_rows(analysis: RouteRiskAnalysis) -> List[Dict[str, Any]]:
             distance_text = f"약 {item.distance_to_route_m:.1f}m"
 
         detail = item.report_description if item.recent_report else item.reason
+        overlap_text = f"약 {item.overlap_length_m:.1f}m" if item.overlap_length_m > 0 else "-"
         rows.append(
             {
                 "출처": SOURCE_LABELS.get(item.source_type, item.source_type),
                 "위험 정보": item.title,
                 "점수": item.risk_score,
+                "공간 판별": SPATIAL_METHOD_LABELS.get(item.spatial_method, item.spatial_method),
                 "경로와 거리": distance_text,
+                "실제 교차 길이": overlap_text,
                 "상세/신고 내용": detail,
                 "신고 시각": _format_datetime(item.report_created_at) if item.recent_report else "-",
                 "누적 신고": item.duplicate_count if item.recent_report else "-",
@@ -397,6 +392,13 @@ def _show_route_card(
             risk_col1.metric("총 위험도", f"{analysis.total_score}/100")
             risk_col2.metric("최근 신고", f"{analysis.recent_report_count}건")
 
+            if analysis.analysis_engine == "postgis":
+                st.caption("공간 분석 엔진: PostGIS · ST_Intersects / ST_DWithin")
+            elif analysis.analysis_engine == "python_fallback":
+                st.warning(analysis.analysis_warning)
+            else:
+                st.caption("공간 분석 엔진: Python 중심 좌표·반경 근사")
+
             if analysis.has_recent_report:
                 st.error("이 경로에는 현재 활성 상태인 최근 사용자 신고가 포함됩니다.")
             elif analysis.total_score >= RISK_TRIGGER_SCORE:
@@ -430,6 +432,30 @@ def _show_route_guides(
                 st.info("별도의 안내 지점이 반환되지 않았습니다.")
 
 
+def _show_save_status() -> None:
+    saved: Optional[SavedRouteRecommendation] = st.session_state.get(SAVE_RESULT_KEY)
+    save_error = st.session_state.get(SAVE_ERROR_KEY)
+
+    if saved:
+        st.success(
+            f"DB 저장 완료 · 검색 로그 #{saved.search_log_id} · "
+            f"경로 {saved.route_count}개 · 위험 근거 {saved.risk_detail_count}개"
+        )
+        with st.expander("저장된 DB ID 확인"):
+            st.json(
+                {
+                    "route_search_logs.id": saved.search_log_id,
+                    "route_results": saved.route_result_ids,
+                    "saved_route_count": saved.route_count,
+                    "saved_risk_detail_count": saved.risk_detail_count,
+                }
+            )
+        return
+
+    if save_error:
+        st.warning(str(save_error))
+
+
 def _show_recommendation(result: RouteRecommendation, direct_distance: float) -> None:
     st.markdown("### 경로 추천 결과")
     primary_analysis = result.primary_analysis
@@ -442,6 +468,14 @@ def _show_recommendation(result: RouteRecommendation, direct_distance: float) ->
 
     if primary_analysis is None:
         st.info("TMAP 경로는 정상 수신했지만 Supabase 위험 분석은 수행하지 못했습니다.")
+    elif primary_analysis.analysis_engine == "postgis":
+        st.success(
+            "PostGIS 공간 분석이 적용되었습니다. 침수 GeoJSON Polygon은 경로 LineString과 "
+            "ST_Intersects로 판별하고, 신고·도로 알림은 ST_DWithin으로 반경을 계산합니다."
+        )
+
+    if primary_analysis is None:
+        pass
     elif not primary_analysis.should_offer_alternative:
         st.success(
             f"기본 경로의 위험도는 {primary_analysis.total_score}/100이고 최근 신고가 없어, "
@@ -509,6 +543,7 @@ def _show_recommendation(result: RouteRecommendation, direct_distance: float) ->
                     "duration_sec": result.primary_route.duration_sec,
                     "risk_score": primary_analysis.total_score if primary_analysis else None,
                     "recent_reports": primary_analysis.recent_report_count if primary_analysis else None,
+                    "analysis_engine": primary_analysis.analysis_engine if primary_analysis else None,
                 },
                 "alternative": (
                     {
@@ -516,6 +551,7 @@ def _show_recommendation(result: RouteRecommendation, direct_distance: float) ->
                         "duration_sec": result.alternative_route.duration_sec,
                         "risk_score": alternative_analysis.total_score if alternative_analysis else None,
                         "recent_reports": alternative_analysis.recent_report_count if alternative_analysis else None,
+                        "analysis_engine": alternative_analysis.analysis_engine if alternative_analysis else None,
                         "pass_points": result.alternative_pass_points,
                     }
                     if result.alternative_route
@@ -531,7 +567,7 @@ def render_route_search(client) -> None:
     st.header("위험 기반 TMAP 도보 경로 추천")
     st.write(
         "지도에서 출발지와 도착지를 선택하면 TMAP 기본 경로를 조회한 뒤, "
-        "Supabase의 침수 구역·도로 통제·최근 사용자 신고를 반영해 위험도를 계산합니다."
+        "PostGIS로 경로 LineString과 침수 Polygon·신고 반경·도로 알림을 공간 분석합니다."
     )
     st.info(
         f"기본 경로 위험도가 {RISK_TRIGGER_SCORE}점 이상이거나 최근 신고가 포함되면, "
@@ -550,11 +586,15 @@ def render_route_search(client) -> None:
         )
 
     if not has_supabase(client):
-        st.warning("Supabase 연결이 없어 위험 분석과 검색 결과 DB 저장은 생략됩니다.")
-    elif not is_logged_in():
+        st.warning("Supabase 연결이 없어 위험 분석은 생략되고 TMAP 기본 경로만 표시됩니다.")
+    elif is_logged_in():
+        st.success(
+            "로그인 상태입니다. 경로 검색이 성공하면 검색 기록·경로 결과·위험 근거를 DB에 자동 저장합니다."
+        )
+    else:
         st.info(
-            "경로 검색과 위험 비교는 로그인 없이 사용할 수 있습니다. "
-            "다만 검색 결과를 DB에 저장하려면 먼저 로그인해주세요."
+            "로그인하지 않아도 경로 검색은 가능하지만 DB에는 저장되지 않습니다. "
+            "저장 기능을 확인하려면 먼저 로그인해주세요."
         )
 
     with st.expander("지점 이름 설정", expanded=False):
@@ -654,11 +694,12 @@ def render_route_search(client) -> None:
             _search_route(app_key, client)
 
     if stored_result:
-        _show_db_save_status()
+        _show_save_status()
         direct_distance = float(st.session_state.get(DIRECT_DISTANCE_KEY, 0.0))
         _show_recommendation(stored_result, direct_distance)
 
     st.caption(
-        "로그인 상태에서 검색하면 route_search_logs, route_results, route_risk_details에 자동 저장됩니다. "
-        "현재 위험 판별은 중심 좌표·반경 기반 근사 방식이며, 다음 단계에서 PostGIS 공간 교차 분석으로 고도화합니다."
+        "로그인 사용자의 검색 결과는 route_search_logs, route_results, route_risk_details에 "
+        "한 트랜잭션으로 저장됩니다. PostGIS 설정이 완료되면 침수 Polygon은 ST_Intersects, "
+        "신고·도로 알림은 ST_DWithin으로 분석되며, 설정 오류 시 기존 Python 근사 방식으로 안전하게 대체됩니다."
     )

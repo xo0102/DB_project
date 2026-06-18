@@ -104,6 +104,12 @@ def _risk_item_popup(item: RouteRiskItem) -> str:
         escape(item.reason),
     ]
 
+    if item.overlap_length_m > 0:
+        parts.append(f"실제 교차 길이: 약 {item.overlap_length_m:.1f}m")
+
+    if item.spatial_method:
+        parts.append(f"공간 판별: {escape(item.spatial_method)}")
+
     if item.recent_report:
         parts.append(f"신고 내용: {escape(item.report_description or '설명 없음')}")
         if item.report_created_at:
@@ -133,6 +139,20 @@ def add_risk_items_to_map(
         color = "red" if item.recent_report else ("orange" if item.source_type == "road_alert" else "blue")
         radius_m = max(15, item.influence_radius_m)
         popup = _risk_item_popup(item)
+
+        if item.hazard_geojson:
+            folium.GeoJson(
+                data=item.hazard_geojson,
+                name=f"{item.title} Polygon",
+                style_function=lambda _feature, polygon_color=color: {
+                    "color": polygon_color,
+                    "weight": 3,
+                    "fillColor": polygon_color,
+                    "fillOpacity": 0.22,
+                },
+                tooltip=f"{item.title} · 실제 교차",
+                popup=folium.Popup(popup, max_width=380),
+            ).add_to(feature_group)
 
         folium.Circle(
             location=[item.latitude, item.longitude],

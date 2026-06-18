@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from services.route_risk_service import (
@@ -25,13 +25,11 @@ class SavedRouteRecommendation:
     route_count: int
     risk_detail_count: int
 
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
 
 def _route_geojson(
     *,
     route: PedestrianRoute,
+    result_type: str,
     route_role: str,
     start: MapPoint,
     end: MapPoint,
@@ -40,14 +38,17 @@ def _route_geojson(
     pass_points: Optional[Sequence[MapPoint]] = None,
 ) -> Dict[str, Any]:
     """
-    PostGIS 도입을 고려해 TMAP 경로를 표준 GeoJSON Feature/LineString으로 정규화한다.
+    TMAP 경로를 표준 GeoJSON Feature/LineString으로 정규화한다.
 
-    GeoJSON 좌표 순서는 [경도, 위도]이며, Folium에서 사용하는 (위도, 경도)와 반대다.
+    Folium 경로 좌표는 (위도, 경도)를 사용하지만 GeoJSON은 [경도, 위도] 순서다.
     """
     coordinates = [
         [float(longitude), float(latitude)]
         for latitude, longitude in route.route_coordinates
     ]
+
+    if len(coordinates) < 2:
+        raise RoutePersistenceError("경로 GeoJSON을 저장하려면 좌표가 2개 이상 필요합니다.")
 
     return {
         "type": "Feature",
@@ -57,6 +58,7 @@ def _route_geojson(
         },
         "properties": {
             "provider": "TMAP",
+            "result_type": result_type,
             "route_role": route_role,
             "distance_m": int(route.distance_m),
             "duration_sec": int(route.duration_sec),
@@ -79,21 +81,29 @@ def _route_geojson(
 
 
 def _risk_detail_reason(item: RouteRiskItem) -> str:
-    parts = [item.reason.strip()]
+    parts: List[str] = []
 
-    if item.recent_report and item.report_description.strip():
-        parts.append(f"신고 내용: {item.report_description.strip()}")
+    if item.reason.strip():
+        parts.append(item.reason.strip())
 
-    if item.recent_report and item.report_created_at:
-        parts.append(f"신고 시각: {item.report_created_at}")
-
-    if item.recent_report and item.duplicate_count:
-        parts.append(f"누적 신고: {item.duplicate_count}건")
+    if item.recent_report:
+        description = item.report_description.strip() or "설명 없음"
+        parts.append(f"신고 내용: {description}")
+        if item.report_created_at:
+            parts.append(f"신고 시각: {item.report_created_at}")
+        if item.duplicate_count:
+            parts.append(f"누적 신고: {item.duplicate_count}건")
 
     if item.distance_to_route_m is not None:
         parts.append(f"경로와의 최소 거리: 약 {item.distance_to_route_m:.1f}m")
 
-    return " | ".join(part for part in parts if part)
+    if item.overlap_length_m > 0:
+        parts.append(f"경로와 위험 Polygon의 실제 교차 길이: 약 {item.overlap_length_m:.1f}m")
+
+    if item.spatial_method:
+        parts.append(f"공간 판별 방식: {item.spatial_method}")
+
+    return " | ".join(parts) or item.title
 
 
 def _risk_detail_payload(item: RouteRiskItem) -> Dict[str, Any]:
@@ -112,52 +122,6 @@ def _analysis_payload(analysis: Optional[RouteRiskAnalysis]) -> List[Dict[str, A
     return [_risk_detail_payload(item) for item in analysis.items]
 
 
-def _primary_reason(recommendation: RouteRecommendation) -> str:
-    analysis = recommendation.primary_analysis
-
-    if analysis is None:
-        return "TMAP 기본 보행 경로입니다. Supabase 위험 분석은 수행되지 않았습니다."
-
-    if analysis.has_recent_report:
-        return (
-            f"최근 사용자 신고 {analysis.recent_report_count}건이 포함되고 "
-            f"총 위험도는 {analysis.total_score}점인 기본 경로입니다."
-        )
-
-    if analysis.total_score >= 50:
-        return f"총 위험도 {analysis.total_score}점으로 기준 50점 이상인 기본 경로입니다."
-
-    return (
-        f"최근 사용자 신고가 없고 총 위험도 {analysis.total_score}점으로 "
-        "기준 50점 미만인 기본 경로입니다."
-    )
-
-
-def _alternative_reason(recommendation: RouteRecommendation) -> str:
-    analysis = recommendation.alternative_analysis
-    primary_analysis = recommendation.primary_analysis
-
-    if analysis is None:
-        return "위험 회피를 위해 생성한 TMAP 대안 경로입니다."
-
-    if recommendation.alternative_fully_avoids_trigger:
-        return (
-            f"최근 사용자 신고를 포함하지 않고 총 위험도를 {analysis.total_score}점으로 낮춘 "
-            "위험 회피 추천 경로입니다."
-        )
-
-    if recommendation.alternative_improves_risk and primary_analysis:
-        return (
-            f"기본 경로 위험도 {primary_analysis.total_score}점보다 낮은 "
-            f"{analysis.total_score}점의 대안 경로입니다."
-        )
-
-    return (
-        f"위험 회피를 시도한 대안 경로이며, 현재 계산된 총 위험도는 "
-        f"{analysis.total_score}점입니다."
-    )
-
-
 def _alternative_is_best(recommendation: RouteRecommendation) -> bool:
     return bool(
         recommendation.alternative_route
@@ -169,6 +133,102 @@ def _alternative_is_best(recommendation: RouteRecommendation) -> bool:
     )
 
 
+def _primary_reason(
+    recommendation: RouteRecommendation,
+    *,
+    stored_as_best: bool,
+) -> str:
+    analysis = recommendation.primary_analysis
+
+    if analysis is None:
+        return "TMAP 기본 보행 경로입니다. Supabase 위험 분석은 수행되지 않았습니다."
+
+    if stored_as_best:
+        if analysis.has_recent_report:
+            return (
+                f"최근 사용자 신고 {analysis.recent_report_count}건이 포함되지만 "
+                "더 안전한 대안 경로를 찾지 못해 기본 경로를 추천 결과로 저장했습니다."
+            )
+        if analysis.total_score >= 50:
+            return (
+                f"총 위험도는 {analysis.total_score}점이지만 더 안전한 대안 경로를 찾지 못해 "
+                "기본 경로를 추천 결과로 저장했습니다."
+            )
+        return (
+            f"최근 사용자 신고가 없고 총 위험도 {analysis.total_score}점으로 "
+            "기준 50점 미만인 기본 경로입니다."
+        )
+
+    return (
+        f"TMAP이 처음 반환한 비교용 기본 경로입니다. "
+        f"총 위험도 {analysis.total_score}점, 최근 신고 {analysis.recent_report_count}건이 반영되었습니다."
+    )
+
+
+def _alternative_reason(
+    recommendation: RouteRecommendation,
+    *,
+    stored_as_best: bool,
+) -> str:
+    analysis = recommendation.alternative_analysis
+    primary_analysis = recommendation.primary_analysis
+
+    if analysis is None:
+        return "위험 회피를 위해 생성한 TMAP 대안 경로입니다."
+
+    if stored_as_best and recommendation.alternative_fully_avoids_trigger:
+        return (
+            f"최근 사용자 신고를 포함하지 않고 총 위험도를 {analysis.total_score}점으로 낮춘 "
+            "위험 회피 추천 경로입니다."
+        )
+
+    if stored_as_best and recommendation.alternative_improves_risk and primary_analysis:
+        return (
+            f"기본 경로 위험도 {primary_analysis.total_score}점보다 낮은 "
+            f"{analysis.total_score}점의 위험 회피 추천 경로입니다."
+        )
+
+    return (
+        f"위험 회피를 시도한 비교용 대안 경로이며, 현재 계산된 총 위험도는 "
+        f"{analysis.total_score}점입니다."
+    )
+
+
+def _build_result_row(
+    *,
+    route: PedestrianRoute,
+    analysis: Optional[RouteRiskAnalysis],
+    result_type: str,
+    route_role: str,
+    recommendation_reason: str,
+    start: MapPoint,
+    end: MapPoint,
+    start_name: str,
+    end_name: str,
+    pass_points: Optional[Sequence[MapPoint]] = None,
+) -> Dict[str, Any]:
+    return {
+        "result_type": result_type,
+        "distance_m": max(0, int(route.distance_m)),
+        "duration_sec": max(0, int(route.duration_sec)),
+        "total_risk_score": (
+            max(0, min(100, int(analysis.total_score))) if analysis else 0
+        ),
+        "route_geojson": _route_geojson(
+            route=route,
+            result_type=result_type,
+            route_role=route_role,
+            start=start,
+            end=end,
+            start_name=start_name,
+            end_name=end_name,
+            pass_points=pass_points,
+        ),
+        "recommendation_reason": recommendation_reason,
+        "risk_details": _analysis_payload(analysis),
+    }
+
+
 def build_route_result_payloads(
     *,
     recommendation: RouteRecommendation,
@@ -177,56 +237,80 @@ def build_route_result_payloads(
     start_name: str,
     end_name: str,
 ) -> List[Dict[str, Any]]:
-    """route_results와 route_risk_details 저장용 JSON 배열을 만든다."""
+    """RPC가 route_results와 route_risk_details에 저장할 JSON 배열을 만든다."""
     alternative_is_best = _alternative_is_best(recommendation)
+    payloads: List[Dict[str, Any]] = []
 
-    primary_result_type = "alternative_1" if alternative_is_best else "best"
-    payloads: List[Dict[str, Any]] = [
-        {
-            "result_type": primary_result_type,
-            "distance_m": int(recommendation.primary_route.distance_m),
-            "duration_sec": int(recommendation.primary_route.duration_sec),
-            "total_risk_score": (
-                int(recommendation.primary_analysis.total_score)
-                if recommendation.primary_analysis
-                else 0
-            ),
-            "route_geojson": _route_geojson(
-                route=recommendation.primary_route,
-                route_role="primary",
+    if alternative_is_best and recommendation.alternative_route:
+        payloads.append(
+            _build_result_row(
+                route=recommendation.alternative_route,
+                analysis=recommendation.alternative_analysis,
+                result_type="best",
+                route_role="risk_avoidance",
+                recommendation_reason=_alternative_reason(
+                    recommendation,
+                    stored_as_best=True,
+                ),
                 start=start,
                 end=end,
                 start_name=start_name,
                 end_name=end_name,
+                pass_points=recommendation.alternative_pass_points,
+            )
+        )
+        payloads.append(
+            _build_result_row(
+                route=recommendation.primary_route,
+                analysis=recommendation.primary_analysis,
+                result_type="alternative_1",
+                route_role="tmap_primary",
+                recommendation_reason=_primary_reason(
+                    recommendation,
+                    stored_as_best=False,
+                ),
+                start=start,
+                end=end,
+                start_name=start_name,
+                end_name=end_name,
+            )
+        )
+        return payloads
+
+    payloads.append(
+        _build_result_row(
+            route=recommendation.primary_route,
+            analysis=recommendation.primary_analysis,
+            result_type="best",
+            route_role="tmap_primary",
+            recommendation_reason=_primary_reason(
+                recommendation,
+                stored_as_best=True,
             ),
-            "recommendation_reason": _primary_reason(recommendation),
-            "risk_details": _analysis_payload(recommendation.primary_analysis),
-        }
-    ]
+            start=start,
+            end=end,
+            start_name=start_name,
+            end_name=end_name,
+        )
+    )
 
     if recommendation.alternative_route:
         payloads.append(
-            {
-                "result_type": "best" if alternative_is_best else "alternative_1",
-                "distance_m": int(recommendation.alternative_route.distance_m),
-                "duration_sec": int(recommendation.alternative_route.duration_sec),
-                "total_risk_score": (
-                    int(recommendation.alternative_analysis.total_score)
-                    if recommendation.alternative_analysis
-                    else 0
+            _build_result_row(
+                route=recommendation.alternative_route,
+                analysis=recommendation.alternative_analysis,
+                result_type="alternative_1",
+                route_role="risk_avoidance",
+                recommendation_reason=_alternative_reason(
+                    recommendation,
+                    stored_as_best=False,
                 ),
-                "route_geojson": _route_geojson(
-                    route=recommendation.alternative_route,
-                    route_role="alternative",
-                    start=start,
-                    end=end,
-                    start_name=start_name,
-                    end_name=end_name,
-                    pass_points=recommendation.alternative_pass_points,
-                ),
-                "recommendation_reason": _alternative_reason(recommendation),
-                "risk_details": _analysis_payload(recommendation.alternative_analysis),
-            }
+                start=start,
+                end=end,
+                start_name=start_name,
+                end_name=end_name,
+                pass_points=recommendation.alternative_pass_points,
+            )
         )
 
     return payloads
@@ -259,7 +343,7 @@ def _parse_route_result_ids(value: Any) -> Dict[str, int]:
 
 def save_route_recommendation(
     *,
-    client,
+    client: Any,
     recommendation: RouteRecommendation,
     start: MapPoint,
     end: MapPoint,
@@ -267,7 +351,7 @@ def save_route_recommendation(
     end_name: str,
 ) -> SavedRouteRecommendation:
     """
-    Supabase RPC를 호출해 검색 로그, 경로 결과, 위험 상세를 하나의 트랜잭션으로 저장한다.
+    Supabase RPC를 호출해 검색 로그, 경로 결과, 위험 상세를 한 트랜잭션으로 저장한다.
 
     사전에 sql/route_persistence.sql을 Supabase SQL Editor에서 실행해야 한다.
     """
@@ -278,7 +362,6 @@ def save_route_recommendation(
         start_name=start_name,
         end_name=end_name,
     )
-
     risk_detail_count = sum(len(row.get("risk_details") or []) for row in payloads)
 
     try:
@@ -311,11 +394,15 @@ def save_route_recommendation(
                 "경로 저장 권한이 거절되었습니다. 로그인 상태와 route_* 테이블의 RLS 정책을 확인해주세요."
             ) from error
 
-        raise RoutePersistenceError(f"경로 검색 결과 DB 저장에 실패했습니다: {message}") from error
+        raise RoutePersistenceError(
+            f"경로 검색 결과 DB 저장에 실패했습니다: {message}"
+        ) from error
 
     data = _normalize_rpc_data(getattr(response, "data", None))
     search_log_id = to_int(data.get("search_log_id"), 0)
     route_result_ids = _parse_route_result_ids(data.get("route_results"))
+    route_count = to_int(data.get("route_count"), len(payloads))
+    saved_risk_detail_count = to_int(data.get("risk_detail_count"), risk_detail_count)
 
     if not search_log_id:
         raise RoutePersistenceError("route_search_logs의 생성 ID를 확인하지 못했습니다.")
@@ -323,6 +410,6 @@ def save_route_recommendation(
     return SavedRouteRecommendation(
         search_log_id=search_log_id,
         route_result_ids=route_result_ids,
-        route_count=len(payloads),
-        risk_detail_count=risk_detail_count,
+        route_count=route_count,
+        risk_detail_count=saved_risk_detail_count,
     )
