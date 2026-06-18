@@ -30,6 +30,16 @@ MAX_DETOUR_HAZARDS = 3
 MAX_PASS_POINTS = 5
 METERS_PER_DEGREE_LAT = 111_320.0
 
+# 위험 유형별 최대 반영 점수. 합계가 100점이 되도록 설계했다.
+# 최근 사용자 신고는 점수와 별개로 대안 경로 탐색 조건을 즉시 충족한다.
+CATEGORY_SCORE_CAPS: Dict[str, int] = {
+    "flood_zone": 50,
+    "road_alert": 20,
+    "user_report": 10,
+    "weather": 20,
+}
+DUPLICATE_COORDINATE_PRECISION = 5
+
 
 @dataclass(frozen=True)
 class RouteRiskContext:
@@ -60,6 +70,8 @@ class RouteRiskItem:
     spatial_method: str = "python_distance"
     overlap_length_m: float = 0.0
     hazard_geojson: Optional[Dict[str, Any]] = None
+    # 원본 데이터 점수와 최종 반영 점수를 구분해 UI와 DB에 설명할 수 있게 한다.
+    raw_risk_score: int = 0
 
     @property
     def is_spatial(self) -> bool:
@@ -394,13 +406,165 @@ def analyze_route_risk(
     return _finalize_analysis(items, analysis_engine="python_approximation")
 
 
+def _hazard_group_key(item: RouteRiskItem) -> Tuple[Any, ...]:
+    """동일한 물리적 위험을 한 번만 계산하기 위한 그룹 키를 만든다."""
+    if item.source_type == "flood_zone" and item.latitude is not None and item.longitude is not None:
+        return (
+            "flood_zone_location",
+            round(item.latitude, DUPLICATE_COORDINATE_PRECISION),
+            round(item.longitude, DUPLICATE_COORDINATE_PRECISION),
+        )
+
+    if item.source_type == "road_alert" and item.latitude is not None and item.longitude is not None:
+        return (
+            "road_alert_location",
+            item.risk_type,
+            round(item.latitude, DUPLICATE_COORDINATE_PRECISION),
+            round(item.longitude, DUPLICATE_COORDINATE_PRECISION),
+        )
+
+    if item.source_type == "user_report":
+        return (
+            "user_report",
+            item.source_id
+            if item.source_id is not None
+            else (
+                item.risk_type,
+                round(item.latitude or 0.0, DUPLICATE_COORDINATE_PRECISION),
+                round(item.longitude or 0.0, DUPLICATE_COORDINATE_PRECISION),
+            ),
+        )
+
+    return (item.source_type, item.source_id, item.title)
+
+
+def _collapse_duplicate_hazards(items: Sequence[RouteRiskItem]) -> List[RouteRiskItem]:
+    """
+    동일 좌표의 중복 침수·도로 데이터를 하나로 묶는다.
+
+    상세 데이터가 여러 행이더라도 같은 물리적 위치의 위험은 최고 점수 한 번만
+    반영해 샘플 데이터 중복으로 점수가 폭증하는 문제를 막는다.
+    """
+    grouped: Dict[Tuple[Any, ...], List[RouteRiskItem]] = {}
+    order: List[Tuple[Any, ...]] = []
+
+    for item in items:
+        key = _hazard_group_key(item)
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(item)
+
+    collapsed: List[RouteRiskItem] = []
+    for key in order:
+        group = grouped[key]
+        representative = max(
+            group,
+            key=lambda item: (
+                max(0, item.risk_score),
+                max(0.0, item.overlap_length_m),
+                -(item.distance_to_route_m or 0.0),
+            ),
+        )
+        raw_score = max(max(0, item.risk_score) for item in group)
+
+        if len(group) == 1:
+            collapsed.append(
+                replace(
+                    representative,
+                    raw_risk_score=raw_score,
+                    risk_score=raw_score,
+                )
+            )
+            continue
+
+        unique_titles = list(dict.fromkeys(item.title for item in group if item.title))
+        title = unique_titles[0] if unique_titles else representative.title
+        if len(unique_titles) > 1:
+            title = f"{title} 외 {len(unique_titles) - 1}건"
+
+        source_ids = [str(item.source_id) for item in group if item.source_id is not None]
+        duplicate_note = (
+            f"동일 위치의 중복 데이터 {len(group)}건을 하나의 위험 구역으로 묶고 "
+            f"최고 점수 {raw_score}점만 계산했습니다."
+        )
+        if source_ids:
+            duplicate_note += f" 원본 ID: {', '.join(source_ids)}."
+
+        collapsed.append(
+            replace(
+                representative,
+                title=title,
+                reason=f"{representative.reason} {duplicate_note}".strip(),
+                risk_score=raw_score,
+                raw_risk_score=raw_score,
+                overlap_length_m=max(item.overlap_length_m for item in group),
+            )
+        )
+
+    return collapsed
+
+
+def _apply_category_score_caps(items: Sequence[RouteRiskItem]) -> List[RouteRiskItem]:
+    """위험 유형별 상한을 적용하고 각 상세 행에 실제 반영 점수를 기록한다."""
+    normalized = [
+        replace(
+            item,
+            raw_risk_score=max(0, item.raw_risk_score or item.risk_score),
+            risk_score=max(0, item.risk_score),
+        )
+        for item in items
+    ]
+
+    indices_by_category: Dict[str, List[int]] = {}
+    for index, item in enumerate(normalized):
+        indices_by_category.setdefault(item.source_type, []).append(index)
+
+    for source_type, indices in indices_by_category.items():
+        cap = CATEGORY_SCORE_CAPS.get(source_type, 100)
+        remaining = cap
+
+        # 같은 유형 안에서는 위험 점수가 높은 항목을 먼저 반영한다.
+        ranked_indices = sorted(
+            indices,
+            key=lambda index: (
+                -normalized[index].raw_risk_score,
+                normalized[index].route_position,
+            ),
+        )
+
+        for index in ranked_indices:
+            item = normalized[index]
+            raw_score = item.raw_risk_score
+            applied_score = min(raw_score, max(0, remaining))
+            remaining -= applied_score
+
+            reason = item.reason
+            if applied_score != raw_score:
+                reason = (
+                    f"{reason} 유형별 최대 {cap}점 상한을 적용하여 "
+                    f"원본 {raw_score}점 중 {applied_score}점만 최종 점수에 반영했습니다."
+                ).strip()
+
+            normalized[index] = replace(
+                item,
+                risk_score=applied_score,
+                reason=reason,
+            )
+
+    return normalized
+
+
 def _finalize_analysis(
     items: Sequence[RouteRiskItem],
     *,
     analysis_engine: str,
     analysis_warning: str = "",
 ) -> RouteRiskAnalysis:
-    normalized_items = list(items)
+    # 1) 같은 위치의 중복 행을 하나로 통합한다.
+    # 2) 침수·도로·신고·날씨 유형별 상한을 적용한다.
+    normalized_items = _apply_category_score_caps(_collapse_duplicate_hazards(items))
+
     category_scores: Dict[str, int] = {}
     for item in normalized_items:
         category_scores[item.source_type] = (

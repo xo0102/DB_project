@@ -110,6 +110,114 @@ class RouteRiskServiceTest(unittest.TestCase):
         self.assertFalse(recommendation.alternative_analysis.has_recent_report)
         self.assertTrue(recommendation.alternative_fully_avoids_trigger)
 
+    def test_collapses_duplicate_flood_zones_at_same_location(self) -> None:
+        context = RouteRiskContext(
+            flood_zones=[
+                {
+                    "id": 1,
+                    "zone_name": "학교 정문 침수 예상 구역",
+                    "center_lat": 37.0000,
+                    "center_lng": 127.0050,
+                    "base_score": 30,
+                    "risk_level": "high",
+                },
+                {
+                    "id": 2,
+                    "zone_name": "학교 정문 침수 이력 구역",
+                    "center_lat": 37.0000,
+                    "center_lng": 127.0050,
+                    "base_score": 30,
+                    "risk_level": "high",
+                },
+                {
+                    "id": 3,
+                    "zone_name": "학교 정문 침수 중복 데이터",
+                    "center_lat": 37.0000,
+                    "center_lng": 127.0050,
+                    "base_score": 30,
+                    "risk_level": "high",
+                },
+            ],
+            weather={"id": 1, "risk_score": 20},
+        )
+
+        analysis = analyze_route_risk(PRIMARY_ROUTE.route_coordinates, context)
+
+        flood_items = [item for item in analysis.items if item.source_type == "flood_zone"]
+        self.assertEqual(len(flood_items), 1)
+        self.assertEqual(flood_items[0].raw_risk_score, 30)
+        self.assertEqual(flood_items[0].risk_score, 30)
+        self.assertIn("중복 데이터 3건", flood_items[0].reason)
+        self.assertEqual(analysis.category_scores["flood_zone"], 30)
+        self.assertEqual(analysis.total_score, 50)
+
+    def test_applies_category_caps_without_exceeding_100(self) -> None:
+        context = RouteRiskContext(
+            report_zones=[
+                {
+                    "id": 10,
+                    "report_id": 100,
+                    "risk_type": "flood",
+                    "center_lat": 37.0000,
+                    "center_lng": 127.0040,
+                    "radius_m": 60,
+                    "risk_score": 20,
+                    "report": {
+                        "id": 100,
+                        "description": "통행이 어렵습니다.",
+                        "duplicate_count": 5,
+                    },
+                }
+            ],
+            flood_zones=[
+                {
+                    "id": 1,
+                    "zone_name": "침수 구역 A",
+                    "center_lat": 37.0000,
+                    "center_lng": 127.0030,
+                    "base_score": 30,
+                },
+                {
+                    "id": 2,
+                    "zone_name": "침수 구역 B",
+                    "center_lat": 37.0000,
+                    "center_lng": 127.0070,
+                    "base_score": 30,
+                },
+            ],
+            road_alerts=[
+                {
+                    "id": 1,
+                    "title": "도로 통제 A",
+                    "alert_type": "road_control",
+                    "center_lat": 37.0000,
+                    "center_lng": 127.0020,
+                    "risk_score": 20,
+                    "description": "통제 중",
+                },
+                {
+                    "id": 2,
+                    "title": "도로 통제 B",
+                    "alert_type": "road_control",
+                    "center_lat": 37.0000,
+                    "center_lng": 127.0080,
+                    "risk_score": 20,
+                    "description": "통제 중",
+                },
+            ],
+            weather={"id": 1, "risk_score": 20},
+        )
+
+        analysis = analyze_route_risk(PRIMARY_ROUTE.route_coordinates, context)
+
+        self.assertEqual(analysis.category_scores["flood_zone"], 50)
+        self.assertEqual(analysis.category_scores["road_alert"], 20)
+        self.assertEqual(analysis.category_scores["user_report"], 10)
+        self.assertEqual(analysis.category_scores["weather"], 20)
+        self.assertEqual(analysis.total_score, 100)
+        self.assertEqual(sum(item.risk_score for item in analysis.items), 100)
+        self.assertTrue(any(item.raw_risk_score > item.risk_score for item in analysis.items))
+
 
 if __name__ == "__main__":
     unittest.main()

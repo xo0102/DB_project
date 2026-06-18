@@ -134,6 +134,54 @@ class SpatialServiceTest(unittest.TestCase):
         self.assertTrue(analysis.has_recent_report)
         self.assertEqual(len(analysis.items), 2)
 
+
+    def test_postgis_analysis_deduplicates_same_location_flood_rows(self) -> None:
+        duplicate_hits = []
+        for source_id, title in [
+            (1, "학교 정문 침수 예상 구역"),
+            (2, "정문 침수 이력 구역"),
+            (5, "정문 중복 침수 구역"),
+        ]:
+            duplicate_hits.append(
+                {
+                    "source_type": "flood_zone",
+                    "source_id": source_id,
+                    "risk_type": "flood",
+                    "title": title,
+                    "risk_score": 30,
+                    "reason": "실제 교차",
+                    "latitude": 37.2792,
+                    "longitude": 127.9001,
+                    "distance_to_route_m": 0,
+                    "influence_radius_m": 0,
+                    "recent_report": False,
+                    "report_description": "",
+                    "report_created_at": "",
+                    "duplicate_count": 0,
+                    "route_position": 0.2,
+                    "spatial_method": "polygon_intersection",
+                    "overlap_length_m": 25.0,
+                }
+            )
+
+        client = _FakeClient(data=duplicate_hits)
+        context = RouteRiskContext(
+            weather={
+                "id": 1,
+                "rain_current_mm": 5.0,
+                "rain_forecast_mm": 8.0,
+                "risk_score": 20,
+            }
+        )
+
+        analysis = analyze_route_risk_postgis(client, ROUTE, context)
+
+        flood_items = [item for item in analysis.items if item.source_type == "flood_zone"]
+        self.assertEqual(len(flood_items), 1)
+        self.assertEqual(flood_items[0].risk_score, 30)
+        self.assertIn("중복 데이터 3건", flood_items[0].reason)
+        self.assertEqual(analysis.total_score, 50)
+
     def test_falls_back_to_python_when_rpc_is_missing(self) -> None:
         client = _FakeClient(error=RuntimeError("PGRST202 analyze_route_spatial not found"))
         context = RouteRiskContext(

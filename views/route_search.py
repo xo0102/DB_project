@@ -337,7 +337,8 @@ def _risk_rows(analysis: RouteRiskAnalysis) -> List[Dict[str, Any]]:
             {
                 "출처": SOURCE_LABELS.get(item.source_type, item.source_type),
                 "위험 정보": item.title,
-                "점수": item.risk_score,
+                "원본 점수": item.raw_risk_score or item.risk_score,
+                "반영 점수": item.risk_score,
                 "공간 판별": SPATIAL_METHOD_LABELS.get(item.spatial_method, item.spatial_method),
                 "경로와 거리": distance_text,
                 "실제 교차 길이": overlap_text,
@@ -359,6 +360,10 @@ def _show_risk_details(title: str, analysis: Optional[RouteRiskAnalysis]) -> Non
             st.success("이 경로에 반영된 위험 요소가 없습니다.")
             return
 
+        st.caption(
+            "동일 위치의 중복 위험 데이터는 한 번만 계산하고, "
+            "침수·도로·신고·날씨 유형별 점수 상한을 적용합니다."
+        )
         st.dataframe(_risk_rows(analysis), use_container_width=True, hide_index=True)
 
         report_items = [item for item in analysis.items if item.recent_report]
@@ -391,6 +396,20 @@ def _show_route_card(
             risk_col1, risk_col2 = st.columns(2)
             risk_col1.metric("총 위험도", f"{analysis.total_score}/100")
             risk_col2.metric("최근 신고", f"{analysis.recent_report_count}건")
+
+            category_labels = {
+                "flood_zone": "침수",
+                "road_alert": "도로",
+                "user_report": "신고",
+                "weather": "날씨",
+            }
+            category_text = " · ".join(
+                f"{category_labels.get(key, key)} {score}점"
+                for key, score in analysis.category_scores.items()
+                if score > 0
+            )
+            if category_text:
+                st.caption(f"유형별 반영 점수: {category_text}")
 
             if analysis.analysis_engine == "postgis":
                 st.caption("공간 분석 엔진: PostGIS · ST_Intersects / ST_DWithin")

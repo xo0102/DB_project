@@ -86,6 +86,11 @@ def _risk_detail_reason(item: RouteRiskItem) -> str:
     if item.reason.strip():
         parts.append(item.reason.strip())
 
+    raw_score = max(0, int(item.raw_risk_score or item.risk_score))
+    applied_score = max(0, int(item.risk_score))
+    if raw_score != applied_score:
+        parts.append(f"점수 정규화: 원본 {raw_score}점 중 {applied_score}점 반영")
+
     if item.recent_report:
         description = item.report_description.strip() or "설명 없음"
         parts.append(f"신고 내용: {description}")
