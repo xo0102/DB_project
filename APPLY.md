@@ -1,23 +1,37 @@
-# TMAP 1단계 패치 적용
+# TMAP 지도 연동 2단계 패치 적용
 
-이 폴더의 내용을 기존 Git 저장소 최상위 폴더에 복사합니다.
+기준 작업 폴더: `~/Desktop/project_split_fixed`
 
-복사 후 기존 데모 화면 파일을 삭제합니다.
-
-```bash
-rm -f views/route_demo.py
-```
-
-실제 `.streamlit/secrets.toml`에는 다음 줄을 직접 추가합니다.
-
-```toml
-TMAP_APP_KEY = "본인 SK open API appKey"
-```
-
-패키지 설치와 테스트:
+## 적용
 
 ```bash
-pip install -r requirements.txt
-python3 -m unittest discover -s tests -v
-streamlit run app.py
+cd ~/Desktop
+rsync -av --exclude='.DS_Store' tmap_step2_map_patch/ project_split_fixed/
 ```
+
+## 테스트 및 실행
+
+```bash
+cd ~/Desktop/project_split_fixed
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+python -m streamlit run app.py
+```
+
+## 변경 파일
+
+- `components/map_components.py`
+- `views/route_search.py`
+- `views/home.py`
+- `config.py`
+- `tests/test_route_map.py`
+
+## 구현 내용
+
+- 지도 클릭으로 출발지·도착지 선택
+- 출발지를 선택하면 도착지 선택 모드로 자동 전환
+- 출발·도착 바꾸기 및 초기화
+- TMAP 경로를 Folium PolyLine으로 표시
+- 출발지(초록)·도착지(빨강) 마커 표시
+- 경로 전체가 보이도록 지도 범위 자동 조절

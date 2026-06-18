@@ -28,7 +28,9 @@ def render_home(client) -> None:
             - 선택 위치 기준 간단 위험도 계산
             - 주요 DB 테이블 조회
             - **TMAP 보행자 경로 API 연동**
-            - 실제 보행 거리·시간·경로 좌표 수신
+            - **지도 클릭 기반 출발지·도착지 선택**
+            - **실제 도보 경로 PolyLine 시각화**
+            - 실제 보행 거리·시간·길 안내 출력
             """
         )
 
@@ -36,12 +38,12 @@ def render_home(client) -> None:
         st.markdown("### 다음 구현 단계")
         st.markdown(
             """
-            - TMAP 경로를 지도에 PolyLine으로 표시
             - 경로 검색 결과를 Supabase에 저장
             - PostGIS 공간 자료형 도입
             - 경로 LineString과 침수 Polygon 교차 판별
             - 경로 위험도 계산 및 안전 경로 추천
             - 기상청 API 실시간 연동
+            - 위험 구간을 경로 지도 위에 함께 표시
             """
         )
 
@@ -64,6 +66,6 @@ def render_home(client) -> None:
             st.warning("TMAP_APP_KEY가 아직 설정되지 않았습니다.")
 
     st.info(
-        "현재는 API에서 실제 보행 경로 데이터를 받아오는 1단계입니다. "
-        "지도 경로 시각화와 PostGIS 위험 분석은 다음 커밋에서 차례대로 추가합니다."
+        "현재는 TMAP에서 받은 실제 도보 경로를 지도에 표시하는 2단계입니다. "
+        "다음 단계에서는 경로를 DB에 저장하고 PostGIS로 위험 구역과의 교차 여부를 분석합니다."
     )
