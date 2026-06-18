@@ -30,6 +30,8 @@ def render_home(client) -> None:
             - **경로별 침수·도로 통제·최근 신고 위험 분석**
             - **50점 이상 또는 최근 신고 포함 시 우회 경로 탐색**
             - **경로에 포함된 신고 내용과 위험 근거 표시**
+            - **경로 검색 로그·추천 경로·위험 상세 DB 저장**
+            - **경로 좌표를 표준 GeoJSON LineString으로 저장**
             """
         )
 
@@ -37,10 +39,8 @@ def render_home(client) -> None:
         st.markdown("### 다음 구현 단계")
         st.markdown(
             """
-            - 경로 검색 요청을 `route_search_logs`에 저장
-            - 기본·대안 경로를 `route_results`에 저장
-            - 경로별 위험 근거를 `route_risk_details`에 저장
             - PostGIS 공간 자료형 도입
+            - 저장된 GeoJSON 경로를 PostGIS LineString으로 변환
             - 경로 LineString과 침수 Polygon의 정확한 교차 판별
             - 기상청 API 실시간 연동
             """
@@ -65,6 +65,6 @@ def render_home(client) -> None:
             st.warning("TMAP_APP_KEY가 아직 설정되지 않았습니다.")
 
     st.info(
-        "현재 단계에서는 중심 좌표와 반경을 이용해 경로 위험을 근사 분석합니다. "
-        "다음 단계에서 검색 결과를 DB에 저장하고, 이후 PostGIS로 실제 공간 교차 여부를 정밀 분석합니다."
+        "로그인 상태의 경로 검색 결과는 세 경로 테이블에 자동 저장됩니다. "
+        "현재는 중심 좌표와 반경으로 위험을 근사 분석하며, 다음 단계에서 PostGIS로 실제 공간 교차 여부를 정밀 분석합니다."
     )

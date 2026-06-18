@@ -12,6 +12,12 @@ from components.map_components import (
 )
 from config import DEFAULT_LAT, DEFAULT_LNG, KST
 from db.client import has_supabase
+from services.auth_service import is_logged_in
+from services.route_persistence_service import (
+    RoutePersistenceError,
+    SavedRouteRecommendation,
+    save_route_recommendation,
+)
 from services.route_risk_service import (
     RISK_TRIGGER_SCORE,
     RouteRecommendation,
@@ -38,6 +44,8 @@ SELECT_TARGET_WIDGET_KEY = "route_select_target_widget"
 LAST_CLICK_KEY = "route_last_processed_click"
 MAP_VERSION_KEY = "route_map_version"
 FLASH_MESSAGE_KEY = "route_flash_message"
+SAVE_SUMMARY_KEY = "route_db_save_summary"
+SAVE_ERROR_KEY = "route_db_save_error"
 
 DEFAULT_END_LAT = DEFAULT_LAT + 0.003
 DEFAULT_END_LNG = DEFAULT_LNG + 0.003
@@ -100,6 +108,8 @@ def _init_route_state() -> None:
 def _clear_route_result() -> None:
     st.session_state.pop(SESSION_RECOMMENDATION_KEY, None)
     st.session_state.pop(DIRECT_DISTANCE_KEY, None)
+    st.session_state.pop(SAVE_SUMMARY_KEY, None)
+    st.session_state.pop(SAVE_ERROR_KEY, None)
 
 
 def _sync_select_target_from_widget() -> None:
@@ -251,6 +261,36 @@ def _search_route(app_key: str, client) -> None:
             end[0],
             end[1],
         )
+        st.session_state.pop(SAVE_SUMMARY_KEY, None)
+        st.session_state.pop(SAVE_ERROR_KEY, None)
+
+        if has_supabase(client) and is_logged_in():
+            try:
+                with st.spinner(
+                    "경로 검색 기록, 추천 경로, 위험 근거를 Supabase에 저장하고 있습니다..."
+                ):
+                    save_summary = save_route_recommendation(
+                        client=client,
+                        recommendation=recommendation,
+                        start=start,
+                        end=end,
+                        start_name=start_name,
+                        end_name=end_name,
+                    )
+                st.session_state[SAVE_SUMMARY_KEY] = save_summary
+            except RoutePersistenceError as error:
+                # 경로 화면은 유지하고 DB 저장 실패만 별도로 안내한다.
+                st.session_state[SAVE_ERROR_KEY] = str(error)
+        elif has_supabase(client):
+            st.session_state[SAVE_ERROR_KEY] = (
+                "로그인하지 않아 이번 검색 결과는 DB에 저장하지 않았습니다. "
+                "로그인 후 다시 검색하면 route_search_logs, route_results, "
+                "route_risk_details에 자동 저장됩니다."
+            )
+        else:
+            st.session_state[SAVE_ERROR_KEY] = (
+                "Supabase에 연결되지 않아 이번 검색 결과는 DB에 저장하지 않았습니다."
+            )
 
         if recommendation.alternative_route:
             st.session_state[FLASH_MESSAGE_KEY] = (
@@ -268,6 +308,27 @@ def _search_route(app_key: str, client) -> None:
     except Exception as error:
         _clear_route_result()
         st.error(f"예상하지 못한 오류가 발생했습니다: {error}")
+
+
+def _show_db_save_status() -> None:
+    summary: Optional[SavedRouteRecommendation] = st.session_state.get(SAVE_SUMMARY_KEY)
+    error_message = st.session_state.get(SAVE_ERROR_KEY)
+
+    if summary:
+        st.success(
+            f"DB 저장 완료: 검색 로그 1건, 경로 결과 {summary.route_count}건, "
+            f"위험 상세 {summary.risk_detail_count}건"
+        )
+        with st.expander("저장된 DB ID 확인"):
+            st.json(summary.to_dict())
+        return
+
+    if error_message:
+        st.warning(error_message)
+        if "row-level security" in str(error_message).lower() or "42501" in str(error_message):
+            st.info(
+                "Supabase SQL Editor에서 `sql/route_persistence.sql`을 한 번 실행했는지 확인해주세요."
+            )
 
 
 def _risk_rows(analysis: RouteRiskAnalysis) -> List[Dict[str, Any]]:
@@ -489,7 +550,12 @@ def render_route_search(client) -> None:
         )
 
     if not has_supabase(client):
-        st.warning("Supabase 연결이 없어 위험 분석은 생략되고 TMAP 기본 경로만 표시됩니다.")
+        st.warning("Supabase 연결이 없어 위험 분석과 검색 결과 DB 저장은 생략됩니다.")
+    elif not is_logged_in():
+        st.info(
+            "경로 검색과 위험 비교는 로그인 없이 사용할 수 있습니다. "
+            "다만 검색 결과를 DB에 저장하려면 먼저 로그인해주세요."
+        )
 
     with st.expander("지점 이름 설정", expanded=False):
         name_col1, name_col2 = st.columns(2)
@@ -588,10 +654,11 @@ def render_route_search(client) -> None:
             _search_route(app_key, client)
 
     if stored_result:
+        _show_db_save_status()
         direct_distance = float(st.session_state.get(DIRECT_DISTANCE_KEY, 0.0))
         _show_recommendation(stored_result, direct_distance)
 
     st.caption(
-        "현재 단계는 중심 좌표·반경 기반 근사 분석이며 검색 결과를 DB에 저장하지 않습니다. "
-        "다음 단계에서 route_results 저장과 PostGIS의 정확한 공간 교차 판별을 연결합니다."
+        "로그인 상태에서 검색하면 route_search_logs, route_results, route_risk_details에 자동 저장됩니다. "
+        "현재 위험 판별은 중심 좌표·반경 기반 근사 방식이며, 다음 단계에서 PostGIS 공간 교차 분석으로 고도화합니다."
     )
