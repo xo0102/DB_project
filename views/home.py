@@ -12,7 +12,7 @@ def render_home(client) -> None:
 
     st.write(
         "침수 위험 구역, 도로 통제 정보, 날씨 정보, 사용자 신고 데이터를 활용하여 "
-        "안전한 보행 경로 안내 기능으로 확장하는 Streamlit + Supabase 프로젝트입니다."
+        "단순 최단 경로가 아니라 위험 근거를 설명하는 보행 경로를 제공하는 Streamlit + Supabase 프로젝트입니다."
     )
 
     col1, col2 = st.columns(2)
@@ -22,15 +22,14 @@ def render_home(client) -> None:
         st.markdown(
             """
             - Supabase 연결 및 회원 인증
-            - 사용자 위험 신고 저장
-            - 신고 기반 위험 구역 생성
-            - Folium 기반 위험 지도 표시
-            - 선택 위치 기준 간단 위험도 계산
-            - 주요 DB 테이블 조회
-            - **TMAP 보행자 경로 API 연동**
-            - **지도 클릭 기반 출발지·도착지 선택**
-            - **실제 도보 경로 PolyLine 시각화**
-            - 실제 보행 거리·시간·길 안내 출력
+            - 사용자 위험 신고 저장 및 활성 위험 구역 생성
+            - Folium 기반 위험 지도와 간단 위험도 계산
+            - TMAP 보행자 경로 API 연동
+            - 지도 클릭 기반 출발지·도착지 선택
+            - 실제 도보 경로 PolyLine 시각화
+            - **경로별 침수·도로 통제·최근 신고 위험 분석**
+            - **50점 이상 또는 최근 신고 포함 시 우회 경로 탐색**
+            - **경로에 포함된 신고 내용과 위험 근거 표시**
             """
         )
 
@@ -38,12 +37,12 @@ def render_home(client) -> None:
         st.markdown("### 다음 구현 단계")
         st.markdown(
             """
-            - 경로 검색 결과를 Supabase에 저장
+            - 경로 검색 요청을 `route_search_logs`에 저장
+            - 기본·대안 경로를 `route_results`에 저장
+            - 경로별 위험 근거를 `route_risk_details`에 저장
             - PostGIS 공간 자료형 도입
-            - 경로 LineString과 침수 Polygon 교차 판별
-            - 경로 위험도 계산 및 안전 경로 추천
+            - 경로 LineString과 침수 Polygon의 정확한 교차 판별
             - 기상청 API 실시간 연동
-            - 위험 구간을 경로 지도 위에 함께 표시
             """
         )
 
@@ -66,6 +65,6 @@ def render_home(client) -> None:
             st.warning("TMAP_APP_KEY가 아직 설정되지 않았습니다.")
 
     st.info(
-        "현재는 TMAP에서 받은 실제 도보 경로를 지도에 표시하는 2단계입니다. "
-        "다음 단계에서는 경로를 DB에 저장하고 PostGIS로 위험 구역과의 교차 여부를 분석합니다."
+        "현재 단계에서는 중심 좌표와 반경을 이용해 경로 위험을 근사 분석합니다. "
+        "다음 단계에서 검색 결과를 DB에 저장하고, 이후 PostGIS로 실제 공간 교차 여부를 정밀 분석합니다."
     )

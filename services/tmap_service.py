@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 import requests
@@ -255,9 +255,17 @@ def search_pedestrian_route(
     end_lng: float,
     start_name: str = "출발지",
     end_name: str = "도착지",
+    pass_points: Optional[Sequence[Tuple[float, float]]] = None,
 ) -> PedestrianRoute:
     """TMAP 보행자 경로 API를 호출하고 앱용 경로 결과를 반환한다."""
     _validate_request(app_key, start_lat, start_lng, end_lat, end_lng)
+
+    normalized_pass_points = list(pass_points or [])
+    if len(normalized_pass_points) > 5:
+        raise TmapApiError("보행자 경로의 경유지는 최대 5개까지 사용할 수 있습니다.")
+
+    for index, (pass_lat, pass_lng) in enumerate(normalized_pass_points, start=1):
+        _validate_coordinate(float(pass_lat), float(pass_lng), f"경유지 {index}")
 
     payload = {
         "startX": f"{start_lng:.7f}",
@@ -271,6 +279,13 @@ def search_pedestrian_route(
         "searchOption": "0",
         "sort": "index",
     }
+
+    if normalized_pass_points:
+        # TMAP 보행자 경로 API는 경유지를 "경도,위도_경도,위도" 형식으로 받는다.
+        payload["passList"] = "_".join(
+            f"{float(pass_lng):.7f},{float(pass_lat):.7f}"
+            for pass_lat, pass_lng in normalized_pass_points
+        )
     headers = {
         "accept": "application/json",
         "content-type": "application/json",

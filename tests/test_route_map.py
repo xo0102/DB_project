@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from components.map_components import create_route_selection_map
+from components.map_components import create_route_comparison_map, create_route_selection_map
+from services.route_risk_service import RouteRiskAnalysis, RouteRiskItem
 
 
 class RouteMapTest(unittest.TestCase):
@@ -24,6 +25,53 @@ class RouteMapTest(unittest.TestCase):
         self.assertIn("TMAP 도보 경로", rendered_html)
         self.assertIn("출발", rendered_html)
         self.assertIn("도착", rendered_html)
+
+    def test_renders_two_routes_and_report_popup(self) -> None:
+        analysis = RouteRiskAnalysis(
+            total_score=10,
+            items=[
+                RouteRiskItem(
+                    source_type="user_report",
+                    source_id=1,
+                    risk_type="flood",
+                    title="최근 사용자 신고 · 침수 위험",
+                    risk_score=10,
+                    reason="최근 신고 구역이 경로와 겹칩니다.",
+                    latitude=37.2800,
+                    longitude=127.9010,
+                    influence_radius_m=50,
+                    recent_report=True,
+                    report_description="보행로에 물이 고였습니다.",
+                    report_created_at="2026-06-18T09:00:00+00:00",
+                    duplicate_count=2,
+                )
+            ],
+            category_scores={"user_report": 10},
+            has_recent_report=True,
+        )
+
+        route_map = create_route_comparison_map(
+            start=(37.2792, 127.9001),
+            end=(37.2822, 127.9031),
+            primary_coordinates=[
+                (37.2792, 127.9001),
+                (37.2800, 127.9010),
+                (37.2822, 127.9031),
+            ],
+            alternative_coordinates=[
+                (37.2792, 127.9001),
+                (37.2810, 127.9005),
+                (37.2822, 127.9031),
+            ],
+            primary_analysis=analysis,
+            start_name="출발",
+            end_name="도착",
+        )
+
+        rendered_html = route_map.get_root().render()
+        self.assertIn("기본 TMAP 경로", rendered_html)
+        self.assertIn("위험 회피 대안 경로", rendered_html)
+        self.assertIn("보행로에 물이 고였습니다", rendered_html)
 
 
 if __name__ == "__main__":

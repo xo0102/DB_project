@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from html import escape
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import folium
 from streamlit_folium import st_folium
 
 from config import DEFAULT_ZOOM, RISK_TYPE_LABELS
+from services.route_risk_service import RouteRiskAnalysis, RouteRiskItem
 from utils.formatters import to_float, to_int
 
 MapPoint = Tuple[float, float]
@@ -55,14 +57,14 @@ def add_route_endpoint_markers(
     folium.Marker(
         location=list(start),
         tooltip=f"출발지 · {start_name}",
-        popup=f"출발지: {start_name}<br>{start[0]:.6f}, {start[1]:.6f}",
+        popup=f"출발지: {escape(start_name)}<br>{start[0]:.6f}, {start[1]:.6f}",
         icon=folium.Icon(color="green", icon="play"),
     ).add_to(m)
 
     folium.Marker(
         location=list(end),
         tooltip=f"도착지 · {end_name}",
-        popup=f"도착지: {end_name}<br>{end[0]:.6f}, {end[1]:.6f}",
+        popup=f"도착지: {escape(end_name)}<br>{end[0]:.6f}, {end[1]:.6f}",
         icon=folium.Icon(color="red", icon="flag"),
     ).add_to(m)
 
@@ -70,20 +72,88 @@ def add_route_endpoint_markers(
 def add_route_polyline(
     m: folium.Map,
     route_coordinates: Sequence[MapPoint],
+    *,
+    color: str = "#2474FF",
+    tooltip: str = "TMAP 도보 경로",
+    weight: int = 7,
+    opacity: float = 0.9,
+    dash_array: Optional[str] = None,
+    target: Optional[folium.FeatureGroup] = None,
 ) -> None:
     """TMAP에서 받은 (위도, 경도) 좌표 목록을 지도 위 경로선으로 표시한다."""
     if len(route_coordinates) < 2:
         return
 
-    folium.PolyLine(
+    polyline = folium.PolyLine(
         locations=[list(point) for point in route_coordinates],
-        color="#2474FF",
-        weight=7,
-        opacity=0.9,
-        tooltip="TMAP 도보 경로",
+        color=color,
+        weight=weight,
+        opacity=opacity,
+        tooltip=tooltip,
         line_cap="round",
         line_join="round",
-    ).add_to(m)
+        dash_array=dash_array,
+    )
+    polyline.add_to(target or m)
+
+
+def _risk_item_popup(item: RouteRiskItem) -> str:
+    parts = [
+        f"<b>{escape(item.title)}</b>",
+        f"위험 점수: {item.risk_score}점",
+        escape(item.reason),
+    ]
+
+    if item.recent_report:
+        parts.append(f"신고 내용: {escape(item.report_description or '설명 없음')}")
+        if item.report_created_at:
+            parts.append(f"신고 시각: {escape(item.report_created_at)}")
+        parts.append(f"누적 신고: {item.duplicate_count}건")
+
+    return "<br>".join(parts)
+
+
+def add_risk_items_to_map(
+    m: folium.Map,
+    analysis: Optional[RouteRiskAnalysis],
+    *,
+    group_name: str = "경로 위험 요소",
+) -> None:
+    """경로 분석에 포함된 위치 기반 위험 요소를 지도에 표시한다."""
+    if not analysis:
+        return
+
+    feature_group = folium.FeatureGroup(name=group_name, show=True)
+    added = 0
+
+    for item in analysis.spatial_items:
+        if item.latitude is None or item.longitude is None:
+            continue
+
+        color = "red" if item.recent_report else ("orange" if item.source_type == "road_alert" else "blue")
+        radius_m = max(15, item.influence_radius_m)
+        popup = _risk_item_popup(item)
+
+        folium.Circle(
+            location=[item.latitude, item.longitude],
+            radius=radius_m,
+            color=color,
+            fill=True,
+            fill_opacity=0.18,
+            tooltip=f"{item.title} · {item.risk_score}점",
+            popup=folium.Popup(popup, max_width=380),
+        ).add_to(feature_group)
+
+        folium.Marker(
+            location=[item.latitude, item.longitude],
+            tooltip=item.title,
+            popup=folium.Popup(popup, max_width=380),
+            icon=folium.Icon(color=color, icon="warning-sign"),
+        ).add_to(feature_group)
+        added += 1
+
+    if added:
+        feature_group.add_to(m)
 
 
 def fit_map_to_points(
@@ -134,6 +204,60 @@ def create_route_selection_map(
 
     add_route_endpoint_markers(m, start, end, start_name=start_name, end_name=end_name)
     fit_map_to_points(m, points_for_view)
+    return m
+
+
+def create_route_comparison_map(
+    *,
+    start: MapPoint,
+    end: MapPoint,
+    primary_coordinates: Sequence[MapPoint],
+    alternative_coordinates: Optional[Sequence[MapPoint]] = None,
+    primary_analysis: Optional[RouteRiskAnalysis] = None,
+    alternative_analysis: Optional[RouteRiskAnalysis] = None,
+    start_name: str = "출발지",
+    end_name: str = "도착지",
+) -> folium.Map:
+    """기본 경로와 위험 회피 대안 경로를 한 지도에 비교 표시한다."""
+    primary_points = list(primary_coordinates)
+    alternative_points = list(alternative_coordinates or [])
+    all_points = [*primary_points, *alternative_points, start, end]
+    center_lat = sum(point[0] for point in all_points) / len(all_points)
+    center_lng = sum(point[1] for point in all_points) / len(all_points)
+    m = create_base_map(center_lat, center_lng)
+
+    primary_group = folium.FeatureGroup(name="기본 TMAP 경로", show=True)
+    primary_color = (
+        "#EF4444"
+        if primary_analysis and primary_analysis.should_offer_alternative
+        else "#2474FF"
+    )
+    add_route_polyline(
+        m,
+        primary_points,
+        color=primary_color,
+        tooltip="기본 TMAP 경로",
+        target=primary_group,
+    )
+    primary_group.add_to(m)
+
+    if alternative_points:
+        alternative_group = folium.FeatureGroup(name="위험 회피 대안 경로", show=True)
+        add_route_polyline(
+            m,
+            alternative_points,
+            color="#16A34A",
+            tooltip="위험 회피 대안 경로",
+            weight=8,
+            target=alternative_group,
+        )
+        alternative_group.add_to(m)
+
+    # 기본 경로에 실제로 걸린 위험 요소를 표시한다. 대안 경로의 위험은 결과 표에서 별도로 비교한다.
+    add_risk_items_to_map(m, primary_analysis)
+    add_route_endpoint_markers(m, start, end, start_name=start_name, end_name=end_name)
+    fit_map_to_points(m, all_points)
+    folium.LayerControl(collapsed=False).add_to(m)
     return m
 
 

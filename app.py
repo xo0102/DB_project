@@ -38,7 +38,7 @@ def main() -> None:
     elif menu == "DB 테이블 조회":
         render_db_viewer(client)
     elif menu == "경로 검색":
-        render_route_search()
+        render_route_search(client)
 
 
 if __name__ == "__main__":

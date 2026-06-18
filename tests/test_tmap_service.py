@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import Mock, patch
 
-from services.tmap_service import TmapApiError, parse_pedestrian_response
+from services.tmap_service import (
+    TmapApiError,
+    parse_pedestrian_response,
+    search_pedestrian_route,
+)
 
 
 SAMPLE_RESPONSE = {
@@ -73,6 +78,32 @@ class ParsePedestrianResponseTest(unittest.TestCase):
     def test_rejects_empty_features(self) -> None:
         with self.assertRaises(TmapApiError):
             parse_pedestrian_response({"type": "FeatureCollection", "features": []})
+
+    @patch("services.tmap_service.requests.post")
+    def test_sends_pass_list_for_detour_route(self, mock_post: Mock) -> None:
+        response = Mock()
+        response.ok = True
+        response.json.return_value = SAMPLE_RESPONSE
+        mock_post.return_value = response
+
+        search_pedestrian_route(
+            app_key="test-key",
+            start_lat=37.2792,
+            start_lng=127.9001,
+            end_lat=37.2822,
+            end_lng=127.9031,
+            pass_points=[
+                (37.2800, 127.9010),
+                (37.2810, 127.9020),
+            ],
+        )
+
+        payload = mock_post.call_args.kwargs["json"]
+        self.assertEqual(
+            payload["passList"],
+            "127.9010000,37.2800000_127.9020000,37.2810000",
+        )
+
 
 
 if __name__ == "__main__":
