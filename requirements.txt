@@ -3,3 +3,4 @@ supabase
 folium
 streamlit-folium
 geopy
+requests>=2.32,<3

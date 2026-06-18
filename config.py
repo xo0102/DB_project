@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import timedelta, timezone
 
 APP_TITLE = "도시 생존 네비게이터"
-APP_SUBTITLE = "웹 DB 응용 기본틀"
+APP_SUBTITLE = "웹 DB 응용 · TMAP 연동 1단계"
 
 KST = timezone(timedelta(hours=9))
 DEFAULT_LAT = 37.2792
@@ -36,5 +36,5 @@ MENU_ITEMS = [
     "위험 신고",
     "간단 위험도 계산",
     "DB 테이블 조회",
-    "경로 검색 데모",
+    "경로 검색",
 ]

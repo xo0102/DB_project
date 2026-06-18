@@ -1,18 +1,9 @@
 from __future__ import annotations
 
-from typing import Optional
-
 import streamlit as st
 from supabase import create_client
 
-
-def read_secret(key: str) -> Optional[str]:
-    """Streamlit secrets에서 값을 안전하게 읽는다."""
-    try:
-        value = st.secrets[key]
-        return str(value).strip() if value else None
-    except Exception:
-        return None
+from utils.secret_utils import read_secret
 
 
 def get_supabase_client():

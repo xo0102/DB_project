@@ -11,7 +11,7 @@ from views.home import render_home
 from views.risk_calculator import render_simple_risk_calculator
 from views.risk_map import render_risk_map
 from views.risk_report import render_risk_report
-from views.route_demo import render_route_demo
+from views.route_search import render_route_search
 
 
 def main() -> None:
@@ -37,8 +37,8 @@ def main() -> None:
         render_simple_risk_calculator(client)
     elif menu == "DB 테이블 조회":
         render_db_viewer(client)
-    elif menu == "경로 검색 데모":
-        render_route_demo()
+    elif menu == "경로 검색":
+        render_route_search()
 
 
 if __name__ == "__main__":
